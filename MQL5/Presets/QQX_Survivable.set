@@ -1,29 +1,26 @@
 ; Quantum Queen X reconstruction - SURVIVABLE preset
 ;
-; Derived from the 2026.01.01-2026.08.11 backtest of the LowRisk preset, which
-; ended at -11,776 on a 10,000 account.  445 baskets, 440 of them profitable.
-; All of the damage came from two settings, not from the strategy:
+; Sizing is solved from the grid's own geometry (QQX_MM_GRID_BUDGET), so the
+; lot can never exceed what a fully deployed ladder can survive.  On a 10,000
+; account at gold ~4400 this yields about 0.01 lots for 9 slots x 6 levels.
 ;
-;   * InpEquityStopPercent=60 liquidated 4 baskets that still had 202-336%
-;     margin level, for -19,802.  37 of the 42 baskets that dipped that deep
-;     recovered on their own.
-;   * 0.0100 lots per 1000 was too large for the drawdown the grid needs to
-;     survive: one basket ran a floating loss of 137% of balance and was
-;     margin-called at -53% margin level, for -11,738.
-;
-; This preset halves the size, replaces liquidation with a soft brake plus a
-; margin-level guard, and widens the grid geometrically.
-InpPreset=1
+; Both blown backtests were configuration failures, not strategy failures:
+;   run 1: InpEquityStopPercent=60 liquidated 4 baskets that still had
+;          202-336% margin level, for -19,802.
+;   run 2: 0.02 lots/1000 on 9 slots x 12 levels sized entries at ~0.22 lots,
+;          roughly 22x what the account could carry.  One 3-leg basket lost
+;          -12,128 and the account was gone in 10 days.
+InpPreset=0
 InpMagicBase=22345000
 InpTradeSymbol=
 InpSlippagePoints=30
 InpMaxSpreadPoints=60
 InpComment=QQX
-; --- sizing: 0.0050/1000 survives every 2026 drawdown (worst margin level 73%)
-;     use 0.0035 for real headroom (181%)
-InpMMMode=1
+InpMMMode=3
 InpFixedLot=0.01
-InpLotsPer1000=0.0035
+InpLotsPer1000=0.005
+InpMaxBasketDDPercent=25.0
+InpMaxMarginPercent=30.0
 InpMaxLot=10.0
 InpGridLotMultiplier=1.0
 InpTpScale=1
@@ -35,7 +32,7 @@ InpStepFixedPoints=200
 InpAtrPeriod=14
 InpGridTimeframe=1
 InpMinSecondsBetween=60
-InpMaxGridLevels=8
+InpMaxGridLevels=6
 InpUseProfitTrail=false
 InpTrailStartMult=1.0
 InpTrailGiveback=0.3
@@ -53,15 +50,13 @@ InpRsiBuyMax=52.0
 InpRsiSellMin=48.0
 InpExtremeLookback=24
 InpPullbackAtr=0.5
-; --- grid safety: x1.35 spacing turns 8 levels of ~16 USD coverage into ~48 USD
 InpGridStepMult=1.35
-InpGridTrendGuard=true
+InpGridTrendGuard=false
 InpGuardTimeframe=16385
 InpGuardPeriod=50
 InpGuardSlopeAtr=0.12
 InpVolRegimeGate=true
 InpMaxAtrRatio=2.2
-; --- recovery: relax the target on aged baskets, never force a loss
 InpRecoveryLevel=5
 InpRecoveryHours=4.0
 InpRecoveryTargetMult=0.35
@@ -69,8 +64,8 @@ InpBreakEvenHours=24.0
 InpGiveUpHours=0.0
 InpGiveUpLossPct=1.0
 InpPairDeRisk=true
-; --- protection: margin guard instead of liquidation
 InpMinMarginLevel=400.0
+InpAddMarginFloor=150.0
 InpBasketMaxLossPct=0.0
 InpMaxTotalPositions=40
 InpMaxLotsPerSide=0.0

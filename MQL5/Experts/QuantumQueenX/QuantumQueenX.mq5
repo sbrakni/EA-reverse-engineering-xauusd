@@ -38,11 +38,13 @@ input double          InpMaxSpreadPoints    = 60;                 // Max spread 
 input string          InpComment            = "QQX";              // Order comment prefix
 
 input group "=== Money management ==="
-input ENUM_QQX_MM     InpMMMode             = QQX_MM_BALANCE;     // Sizing mode
+input ENUM_QQX_MM     InpMMMode             = QQX_MM_GRID_BUDGET; // Sizing mode
 input double          InpFixedLot           = 0.01;               // Fixed lot (QQX_MM_FIXED)
 input double          InpLotsPer1000        = 0.005;              // Lots per 1000 balance
 input double          InpMaxLot             = 10.0;               // Hard lot cap
 input double          InpGridLotMultiplier  = 1.0;                // Grid volume multiplier
+input double          InpMaxBasketDDPercent = 25.0;               // GRID_BUDGET: worst-case float, % of balance (all slots)
+input double          InpMaxMarginPercent   = 30.0;               // GRID_BUDGET: margin allowance, % of balance (all slots)
 
 input group "=== Distances ==="
 input ENUM_QQX_SCALE  InpTpScale            = QQX_SCALE_PRICE;    // Target scaling
@@ -56,7 +58,7 @@ input int             InpAtrPeriod          = 14;                 // ATR period
 input group "=== Basket management ==="
 input ENUM_TIMEFRAMES InpGridTimeframe      = PERIOD_M1;          // Grid / exit cadence
 input int             InpMinSecondsBetween  = 60;                 // Min seconds between entries
-input int             InpMaxGridLevels      = 12;                 // Global cap on grid levels
+input int             InpMaxGridLevels      = 6;                  // Global cap on grid levels (see risk report)
 input bool            InpUseProfitTrail     = false;              // Trail the basket profit
 input double          InpTrailStartMult     = 1.00;               // Trail arms at N x target
 input double          InpTrailGiveback      = 0.30;               // Close after giving back N of peak
@@ -79,7 +81,7 @@ input double          InpPullbackAtr        = 0.50;               // Required re
 
 input group "=== Risk engineering (post-backtest) ==="
 input double          InpGridStepMult       = 1.35;               // Grid spacing growth per level
-input bool            InpGridTrendGuard     = true;               // Freeze grid against a HTF trend
+input bool            InpGridTrendGuard     = false;              // Freeze grid against a HTF trend (see docs)
 input ENUM_TIMEFRAMES InpGuardTimeframe     = PERIOD_H1;          // Trend-guard timeframe
 input int             InpGuardPeriod        = 50;                 // Trend-guard EMA period
 input double          InpGuardSlopeAtr      = 0.12;               // Opposing slope that blocks adds (ATR/bar)
@@ -96,7 +98,8 @@ input double          InpGiveUpLossPct      = 1.0;                // That bound,
 input bool            InpPairDeRisk         = true;               // Shed legs in funded pairs
 
 input group "=== Account protection ==="
-input double          InpMinMarginLevel     = 400.0;              // Block new risk below this margin level %
+input double          InpMinMarginLevel     = 400.0;              // Block NEW baskets below this margin level %
+input double          InpAddMarginFloor     = 150.0;              // Block grid ADDS below this margin level %
 input double          InpBasketMaxLossPct   = 0.0;                // Hard per-basket stop, % of balance (0=off)
 input int             InpMaxTotalPositions  = 40;                 // Max positions across all slots
 input double          InpMaxLotsPerSide     = 0.0;                // Max total lots per direction (0=off, see docs)
@@ -208,6 +211,13 @@ void BuildStrategyTable(void)
          break;
      }
 
+   //--- Every enabled slot can be live at the same time, so the per-basket
+   //--- risk budget has to be divided between them.  Nine slots each risking
+   //--- 25% of balance is 225% of balance, which is how an account dies.
+   int active=0;
+   for(int i=0;i<QQX_MAX_STRATEGIES;i++) if(on[i]) active++;
+   g_eng.slotShare=(active>0 ? 1.0/(double)active : 1.0);
+
    g_count=0;
    for(int i=0;i<QQX_MAX_STRATEGIES;i++)
      {
@@ -315,6 +325,11 @@ int OnInit(void)
    g_eng.pairDeRisk              =InpPairDeRisk;
    g_eng.basketMaxLossPct        =InpBasketMaxLossPct;
    g_eng.minMarginLevel          =InpMinMarginLevel;
+   g_eng.addMarginFloor          =InpAddMarginFloor;
+   g_eng.mmMode                  =InpMMMode;
+   g_eng.basketBudgetPct         =InpMaxBasketDDPercent;
+   g_eng.marginBudgetPct         =InpMaxMarginPercent;
+   g_eng.slotShare               =1.0;      // replaced in BuildStrategyTable
 
    //--- entry filter
    g_sig.atrPeriod        =InpAtrPeriod;
@@ -343,6 +358,8 @@ int OnInit(void)
    g_dayStartEq=AccountInfoDouble(ACCOUNT_EQUITY);
    g_dayStamp  =DayStamp(TimeCurrent());
 
+   PrintRiskReport();
+
    //--- Two settings destroyed the 2026 backtest.  Warn loudly about both.
    if(InpEquityStopPercent>0.0)
       PrintFormat("QQX WARNING: InpEquityStopPercent=%.0f is a LIQUIDATION, not a stop loss. "
@@ -362,6 +379,69 @@ int OnInit(void)
    PrintFormat("QQX ready on %s - %d strategy slot(s), preset %s, magic base %I64u",
                sym,g_count,EnumToString(InpPreset),InpMagicBase);
    return(INIT_SUCCEEDED);
+  }
+
+//+------------------------------------------------------------------+
+//| Risk report, printed once at init.                                |
+//|                                                                   |
+//| Both blown backtests were configuration failures that were fully   |
+//| computable before the first trade: a fully deployed grid simply    |
+//| cost more than the account had.  This prints that number up front  |
+//| instead of discovering it afterwards.                              |
+//+------------------------------------------------------------------+
+void PrintRiskReport(void)
+  {
+   double balance=AccountInfoDouble(ACCOUNT_BALANCE);
+   if(balance<=0.0) return;
+
+   double totLoss=0.0,totMargin=0.0,totLots=0.0;
+   int    infeasible=0;
+
+   Print("QQX ---------------- projected worst case ----------------");
+   PrintFormat("QQX  balance %.2f   leverage 1:%d   %s @ %.2f",
+               balance,(int)AccountInfoInteger(ACCOUNT_LEVERAGE),
+               g_sym.Symbol(),g_sym.Bid());
+   Print("QQX  slot                    lvl   base    total   span     float    margin");
+
+   for(int i=0;i<g_count;i++)
+     {
+      double baseLot=0.0,lots=0.0,span=0.0,margin=0.0;
+      double loss=g_strat[i].ProjectedWorstCase(baseLot,lots,span,margin);
+      totLoss+=loss; totMargin+=margin; totLots+=lots;
+      if(baseLot<=0.0)
+        {
+         infeasible++;
+         PrintFormat("QQX  %-22s %3d      -        -      - "
+                     "   INFEASIBLE: budget implies less than the minimum lot",
+                     g_strat[i].Name(),g_strat[i].MaxLevels());
+         continue;
+        }
+      PrintFormat("QQX  %-22s %3d %6.2f %8.2f %6.1f %9.0f %9.0f",
+                  g_strat[i].Name(),g_strat[i].MaxLevels(),baseLot,lots,span,loss,margin);
+     }
+
+   double ddPct=(balance>0.0 ? -totLoss/balance*100.0 : 0.0);
+   double lvlAt =(totMargin>0.0 ? (balance+totLoss)/totMargin*100.0 : 0.0);
+
+   PrintFormat("QQX  ALL SLOTS FULLY DEPLOYED: %.2f lots, floating %.0f "
+               "(%.1f%% of balance), margin %.0f",totLots,totLoss,ddPct,totMargin);
+   PrintFormat("QQX  margin level in that state: %.0f%%  (broker stop-out is "
+               "typically 50%%)",lvlAt);
+
+   if(ddPct>=100.0 || (lvlAt>0.0 && lvlAt<100.0))
+      Print("QQX  *** THIS CONFIGURATION CANNOT SURVIVE ITS OWN GRID. ***  "
+            "Reduce InpMaxBasketDDPercent / InpLotsPer1000, reduce "
+            "InpMaxGridLevels, enable fewer slots, or raise InpGridStepMult.");
+   else if(ddPct>=60.0)
+      Print("QQX  WARNING: a full deployment would cost most of the account.");
+
+   if(infeasible>0)
+      PrintFormat("QQX  %d slot(s) will NOT TRADE: their risk budget is smaller than the "
+                  "broker's minimum lot.  Enable fewer slots, lower InpMaxGridLevels, "
+                  "raise InpMaxBasketDDPercent, or fund the account further.  "
+                  "(A 10k account at gold ~4400 supports about 9 slots x 6 levels, "
+                  "or 5 slots x 8 levels.)",infeasible);
+   Print("QQX -------------------------------------------------------");
   }
 
 //+------------------------------------------------------------------+

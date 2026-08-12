@@ -214,10 +214,13 @@ def main():
               f"shipped {shipped[slot]['step']:.2f} <= raw {raw:.2f} bp (n={len(s)})")
 
     # --------------------------------------------------------- max grid levels
-    print("\ngrid depth cap")
+    print("\ngrid depth observed in the live record")
     depth = d.groupby("lb").size()
     cov = (depth <= 12).mean()
-    check("InpMaxGridLevels=12 covers >=99.8% of baskets", cov >= 0.998, f"{cov:.3%}")
+    # NB: this is a statement about the ORIGINAL EA's observed depth, not about
+    # the shipped InpMaxGridLevels default -- that one is set by the risk budget
+    # (see docs/OPTIMIZATION.md), which is a tighter constraint than coverage.
+    check("12 levels cover >=99.8% of live baskets", cov >= 0.998, f"{cov:.3%}")
 
     print()
     if failures:

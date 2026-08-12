@@ -73,7 +73,12 @@ struct SEngineCfg
    bool              pairDeRisk;        // shed legs in pairs while in recovery
 
    double            basketMaxLossPct;  // hard per-basket stop, % of balance
-   double            minMarginLevel;    // block new risk below this margin level %
+   double            minMarginLevel;    // block NEW baskets below this margin level %
+   double            addMarginFloor;    // block grid ADDS only below this level %
+   ENUM_QQX_MM       mmMode;
+   double            basketBudgetPct;   // worst-case budget per basket, % of balance
+   double            marginBudgetPct;   // margin allowance for a full ladder, % of balance
+   double            slotShare;         // 1 / number of active slots
   };
 
 //+------------------------------------------------------------------+
@@ -238,6 +243,27 @@ private:
       return(lvl>=m_eng.minMarginLevel);
      }
 
+   //+---------------------------------------------------------------+
+   //| Volume of the first entry.                                     |
+   //|                                                                |
+   //| In QQX_MM_GRID_BUDGET the lot is solved so that this slot's     |
+   //| fully deployed ladder floats no more than its share of the      |
+   //| configured per-basket budget.  Because every slot may be live   |
+   //| at once, the budget is divided by the number of active slots.   |
+   //+---------------------------------------------------------------+
+   double            EntryVolume(void) const
+     {
+      if(m_eng.mmMode!=QQX_MM_GRID_BUDGET)
+         return(m_money.BaseVolume(m_cfg.riskShare));
+
+      double balance=AccountInfoDouble(ACCOUNT_BALANCE);
+      if(balance<=0.0) return(0.0);
+      double budget=balance*m_eng.basketBudgetPct/100.0*m_eng.slotShare*m_cfg.riskShare;
+      double margin=balance*m_eng.marginBudgetPct/100.0*m_eng.slotShare*m_cfg.riskShare;
+      return(m_money.GridBudgetVolume(m_cfg.maxLevels,StepDistance(),
+                                      m_eng.gridStepMult,budget,margin));
+     }
+
    bool              WantsBuy(void)  const { return(m_cfg.dir!=QQX_DIR_SELL_ONLY); }
    bool              WantsSell(void) const { return(m_cfg.dir!=QQX_DIR_BUY_ONLY);  }
 
@@ -345,19 +371,27 @@ private:
       if(m_basket.Count()==0) return;
       if(m_basket.Count()>=m_cfg.maxLevels) return;
 
-      //--- an aged or account-braked basket is being wound down, not extended
-      if(accountBrake) return;
-      if(RecoveryStage(now,accountBrake)>=2) return;
-
+      //--- IMPORTANT: a basket that already exists is allowed to keep
+      //--- averaging.  Averaging down IS this system's recovery mechanism -
+      //--- in the 2026 record 37 of the 42 baskets that went deeply under
+      //--- water still closed in profit, and they did it by moving their
+      //--- average price toward the market.  Freezing a grid strands it at
+      //--- the worst average it ever had and removes any way out.
+      //---
+      //--- So the account brake, the margin guard and the trend guard gate
+      //--- NEW baskets (see CheckEntry), not the completion of a committed
+      //--- ladder.  The ladder was budgeted in full when it was opened.
       SBasketState st=m_basket.State();
 
-      //--- do not average into a higher-timeframe trend that is running
-      //--- against the basket.  All five losing baskets of the 2026 run
-      //--- share exactly this signature.
       if(m_eng.gridTrendGuard && !m_signal.AllowsGridAdd(st.isBuy)) return;
 
-      //--- never deepen a grid on thin margin
-      if(!MarginOk()) return;
+      //--- the only margin rule that applies to an add is the one that stops
+      //--- us walking into the broker's own stop-out
+      if(m_eng.addMarginFloor>0.0 && AccountInfoDouble(ACCOUNT_MARGIN)>0.0)
+        {
+         double lvl=AccountInfoDouble(ACCOUNT_MARGIN_LEVEL);
+         if(lvl>0.0 && lvl<m_eng.addMarginFloor) return;
+        }
 
       double step=StepForLevel(m_basket.Count());
       if(step<=0.0) return;
@@ -399,7 +433,7 @@ private:
       else if(WantsSell() && m_signal.Allows(false)) buy=false;
       else return;
 
-      double vol=m_money.BaseVolume(m_cfg.riskShare);
+      double vol=EntryVolume();
       if(vol<=0.0) return;
 
       m_baseVolume=vol;
@@ -498,6 +532,28 @@ public:
       //--- A fresh basket may only start on a bar open of the slot timeframe.
       if(newSignalBar) CheckEntry(now);
      }
+
+   //+---------------------------------------------------------------+
+   //| Projected worst case for this slot, for the init report.       |
+   //| Returns the floating loss (negative) of a fully deployed grid  |
+   //| and fills in the volumes it would carry.                       |
+   //+---------------------------------------------------------------+
+   double            ProjectedWorstCase(double &baseLot,double &totalLots,
+                                        double &spanCovered,double &marginNeeded) const
+     {
+      baseLot=EntryVolume();
+      totalLots=0.0; spanCovered=0.0; marginNeeded=0.0;
+      if(baseLot<=0.0) return(0.0);
+
+      double loss=m_money.GridWorstCase(baseLot,m_cfg.maxLevels,StepDistance(),
+                                        m_eng.gridStepMult,totalLots,spanCovered);
+      double lev=(double)AccountInfoInteger(ACCOUNT_LEVERAGE);
+      if(lev<=0.0) lev=100.0;
+      marginNeeded=totalLots*m_sym.ContractSize()*m_sym.Bid()/lev;
+      return(loss);
+     }
+
+   int               MaxLevels(void) const { return(m_cfg.maxLevels); }
 
    //--- direction of this slot, for the portfolio exposure cap
    bool              PrefersBuy(void) const { return(m_cfg.dir!=QQX_DIR_SELL_ONLY); }

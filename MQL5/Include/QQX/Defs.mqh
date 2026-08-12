@@ -59,9 +59,10 @@ enum ENUM_QQX_SCALE
 //+------------------------------------------------------------------+
 enum ENUM_QQX_MM
   {
-   QQX_MM_FIXED    = 0,    // Fixed lot
-   QQX_MM_BALANCE  = 1,    // Lots per 1000 of balance
-   QQX_MM_EQUITY   = 2     // Lots per 1000 of equity
+   QQX_MM_FIXED       = 0, // Fixed lot
+   QQX_MM_BALANCE     = 1, // Lots per 1000 of balance
+   QQX_MM_EQUITY      = 2, // Lots per 1000 of equity
+   QQX_MM_GRID_BUDGET = 3  // Solve the lot from the grid's worst case (recommended)
   };
 
 //+------------------------------------------------------------------+

@@ -84,6 +84,118 @@ public:
      }
 
    //+---------------------------------------------------------------+
+   //| Solve the base volume from the grid's own worst case.          |
+   //|                                                                |
+   //| This is the sizing mode that makes a grid safe, and it is the   |
+   //| one lesson of the two blown backtests.  Instead of picking a    |
+   //| lot and hoping, it asks: if this basket deploys ALL of its      |
+   //| levels and price stops exactly at the last one, how much is     |
+   //| floating?  Then it sizes so that number equals the budget.      |
+   //|                                                                |
+   //|   level i sits D_i away from the first entry, where the gaps    |
+   //|   grow geometrically:  D_0 = 0,  D_i = D_(i-1) + step*m^(i-1)   |
+   //|   worst-case loss     = SUM_i  lot_i * (D_last - D_i) * value   |
+   //|                                                                |
+   //| Everything is known at entry time, so the lot follows directly. |
+   //| Nothing downstream then has to interfere with the grid - and    |
+   //| interfering is exactly what strands a basket, because averaging |
+   //| down IS the recovery mechanism.                                 |
+   //|                                                                |
+   //| A second ceiling applies: the fully deployed ladder must also   |
+   //| fit inside a margin allowance.  On a small account margin, not  |
+   //| the loss budget, is usually the binding constraint.             |
+   //|                                                                |
+   //| Returns 0 when the answer is below the broker's minimum volume. |
+   //| That is a REFUSAL, not a clamp: rounding 0.002 up to 0.01 would |
+   //| quietly multiply the intended risk by five, which is exactly    |
+   //| how the second account was lost.                                |
+   //+---------------------------------------------------------------+
+   double            GridBudgetVolume(const int levels,const double step,
+                                      const double stepMult,const double budgetMoney,
+                                      const double marginAllowance=0.0) const
+     {
+      if(m_sym==NULL || levels<1 || step<=0.0 || budgetMoney<=0.0) return(0.0);
+
+      double moneyPerPricePerLot=m_sym.MoneyForDistance(1.0,1.0);
+      if(moneyPerPricePerLot<=0.0) return(0.0);
+
+      double sm=(stepMult<1.0 ? 1.0 : stepMult);
+      double gap=step;
+      double dist[];
+      ArrayResize(dist,levels);
+      dist[0]=0.0;
+      for(int i=1;i<levels;i++)
+        {
+         dist[i]=dist[i-1]+gap;
+         gap*=sm;
+        }
+
+      //--- weight each level by its share of the volume ladder
+      double lossFactor=0.0;
+      double w=1.0;
+      for(int i=0;i<levels;i++)
+        {
+         lossFactor+=w*(dist[levels-1]-dist[i]);
+         w*=m_gridMultiplier;
+        }
+      if(lossFactor<=0.0) return(0.0);
+
+      double lot=budgetMoney/(lossFactor*moneyPerPricePerLot);
+
+      //--- margin ceiling for the fully deployed ladder
+      if(marginAllowance>0.0)
+        {
+         double lev=(double)AccountInfoInteger(ACCOUNT_LEVERAGE);
+         if(lev<=0.0) lev=100.0;
+         double wsum=0.0,ww=1.0;
+         for(int i=0;i<levels;i++) { wsum+=ww; ww*=m_gridMultiplier; }
+         double per=wsum*m_sym.ContractSize()*m_sym.Bid()/lev;
+         if(per>0.0)
+           {
+            double lotMargin=marginAllowance/per;
+            if(lotMargin<lot) lot=lotMargin;
+           }
+        }
+
+      if(lot>m_maxLot) lot=m_maxLot;
+      //--- refuse rather than round up past the budget
+      if(lot<m_sym.VolMin()) return(0.0);
+      return(m_sym.NormalizeVolume(lot));
+     }
+
+   //+---------------------------------------------------------------+
+   //| Worst-case floating loss of a fully deployed grid, in money.   |
+   //| Used by the init report so the operator sees the number before |
+   //| the strategy runs rather than after.                            |
+   //+---------------------------------------------------------------+
+   double            GridWorstCase(const double baseVolume,const int levels,
+                                   const double step,const double stepMult,
+                                   double &totalLots,double &spanCovered) const
+     {
+      totalLots=0.0; spanCovered=0.0;
+      if(m_sym==NULL || levels<1 || step<=0.0 || baseVolume<=0.0) return(0.0);
+
+      double sm=(stepMult<1.0 ? 1.0 : stepMult);
+      double gap=step,d=0.0,loss=0.0,w=1.0;
+      double dist[];
+      ArrayResize(dist,levels);
+      for(int i=0;i<levels;i++)
+        {
+         dist[i]=d;
+         if(i<levels-1) { d+=gap; gap*=sm; }
+        }
+      spanCovered=dist[levels-1];
+      for(int i=0;i<levels;i++)
+        {
+         double lot=m_sym.NormalizeVolume(baseVolume*w);
+         totalLots+=lot;
+         loss+=m_sym.MoneyForDistance(dist[levels-1]-dist[i],lot);
+         w*=m_gridMultiplier;
+        }
+      return(loss);
+     }
+
+   //+---------------------------------------------------------------+
    //| Volume for grid entry number "level" (level 0 = first entry).  |
    //|                                                                |
    //| Reverse-engineering note: 269 of the 301 multi-entry baskets    |

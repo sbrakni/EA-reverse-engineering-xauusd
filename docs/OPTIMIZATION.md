@@ -160,3 +160,116 @@ python3 bt_extract.py   # parse the report into bt_deals.csv
 python3 bt_analyse.py   # baskets, slot P&L, loss concentration
 python3 bt_risk.py      # margin survival and stop-loss counterfactuals
 ```
+
+---
+
+# Run 2 post-mortem — and a design error of mine
+
+Second report: same period, `InpPreset=0` (9 slots), `InpLotsPer1000=0.02`,
+`InpMaxGridLevels=12`, `InpEquityStopPercent=0`. Net **−9,282**, account down to
+**717 in ten days**, margin level **0.09 %**, tester stopped after 141 bars.
+
+## The build was not the one from the risk commit
+
+All 18 inputs added by the risk work are **absent** from the report's settings
+block — `InpGridStepMult`, `InpMinMarginLevel`, `InpSoftBrakePercent`,
+`InpRecoveryHours`, `InpPairDeRisk` and the rest. The `.mq5` was not recompiled,
+so none of the changes were in play.
+
+What *was* in play was the half of the advice that is dangerous on its own:
+`InpEquityStopPercent` had been set to 0, removing the circuit breaker, while the
+size stayed at `0.02` lots per 1000 — **four times** the new default — across
+**nine** slots and **twelve** grid levels.
+
+Entry volumes in the run were **0.20–0.25 lots**. Everything ran normally for ten
+days (balance 10,000 → 12,845), then one three-leg basket met a ~184 USD gold
+move and lost **−12,128** in a single close.
+
+## My design error
+
+Reviewing my own risk commit against this: several of the guards I added
+(`gridTrendGuard`, the margin guard, the soft brake) blocked **grid additions**.
+That is wrong, and it would have made things worse in a different way.
+
+Averaging down *is* this system's recovery mechanism — §3 above shows 37 of the
+42 deeply-underwater baskets recovered, and they did it by pulling their average
+price toward the market. Freezing a grid strands it at the worst average it ever
+had, with no way out. I had built the thing that produces the losses I was
+diagnosing.
+
+Fixed: those guards now gate **new baskets only**. A committed ladder always
+completes. The one exception is a floor that keeps an add from walking into the
+broker's stop-out (`InpAddMarginFloor`, 150 %).
+
+## The correct answer: budget the ladder before opening it
+
+Both failures were fully computable before the first trade. If the grid's
+geometry is known — levels, spacing, spacing growth, volume ladder — then the
+floating loss of a *fully deployed* basket is arithmetic:
+
+```
+D_0 = 0 ,  D_i = D_(i-1) + step · m^(i-1)
+worst-case loss = Σ_i  lot_i · (D_last − D_i) · value_per_price
+```
+
+So instead of choosing a lot and hoping, `QQX_MM_GRID_BUDGET` (now the default
+sizing mode) solves for the lot such that the worst case equals a budget, subject
+to a second ceiling that the full ladder's margin fits an allowance. The budget
+is divided by the number of enabled slots, because they can all be live at once —
+nine slots each risking 25 % of balance is 225 % of balance, which is how run 2
+ended.
+
+What that yields on a 10,000 account at gold ≈4400, 1:100:
+
+| Slots | Levels | Span covered | Lot | Worst-case DD | Margin |
+|---|---|---|---|---|---|
+| 9 | 12 | 161 USD | — | — | **infeasible** |
+| 9 | 8 | 44 USD | — | — | **infeasible** |
+| **9** | **6** | 21 USD | **0.01** | 6.9 % | 23.8 % |
+| **5** | **8** | 44 USD | **0.02** | 22.6 % | 35.2 % |
+| 3 | 8 | 44 USD | 0.03 | 20.4 % | 31.7 % |
+
+"Infeasible" means the budget implies **less than the broker's minimum lot**. The
+EA now **refuses to trade that slot** rather than rounding 0.002 up to 0.01 —
+rounding up is a silent 5× risk multiplier, and it is precisely what happened.
+
+Run 2 traded 0.20–0.25 lots where the feasible size was 0.01: **roughly 22×
+oversized**.
+
+## Also new: the risk report
+
+`OnInit` now prints, before the first trade, each slot's base lot, total ladder
+volume, span covered, worst-case floating loss and margin — plus the resulting
+margin level with everything fully deployed:
+
+```
+QQX  ALL SLOTS FULLY DEPLOYED: 0.54 lots, floating -691 (6.9% of balance), margin 2376
+QQX  margin level in that state: 391%  (broker stop-out is typically 50%)
+```
+
+and, when the arithmetic does not work:
+
+```
+QQX  *** THIS CONFIGURATION CANNOT SURVIVE ITS OWN GRID. ***
+```
+
+Both blown runs would have printed that line before placing a single trade.
+
+## Changed defaults
+
+| Input | Was | Now | Why |
+|---|---|---|---|
+| `InpMMMode` | Balance | **GRID_BUDGET** | size solved from the ladder, not guessed |
+| `InpMaxGridLevels` | 12 | **6** | 12 is infeasible for 9 slots on a 10k account |
+| `InpGridTrendGuard` | true | **false** | freezing a grid strands it |
+| `InpMaxBasketDDPercent` | — | 25 | worst case across all slots |
+| `InpMaxMarginPercent` | — | 30 | the binding constraint on small accounts |
+| `InpAddMarginFloor` | — | 150 | adds stop only near the broker's stop-out |
+
+## To reproduce run 2's diagnosis
+
+```bash
+cd analysis
+python3 bt_extract.py /path/to/ReportTester.html
+python3 bt_risk.py
+```
