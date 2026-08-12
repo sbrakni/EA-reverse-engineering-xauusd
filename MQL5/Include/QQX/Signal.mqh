@@ -51,6 +51,11 @@ struct SSignalCfg
    bool              useTrendFilter;   // require EMA fast/slow alignment
    bool              useRsiFilter;
    bool              usePullbackFilter;
+   //--- higher-timeframe guard, used to freeze a grid rather than to enter
+   ENUM_TIMEFRAMES   guardTf;
+   int               guardPeriod;
+   double            guardSlopeAtr;    // opposing slope, in ATR per bar, that blocks adds
+   double            maxAtrRatio;      // block NEW baskets when ATR > N x its own average
   };
 
 //+------------------------------------------------------------------+
@@ -66,6 +71,8 @@ private:
    int               m_hEmaFast;
    int               m_hEmaSlow;
    int               m_hRsi;
+   int               m_hGuardMa;       // higher-timeframe trend guard
+   int               m_hGuardAtr;
    SSignalCfg        m_cfg;
    bool              m_ready;
 
@@ -82,7 +89,8 @@ private:
 public:
                      CSignal(void): m_symbol(""),m_tf(PERIOD_M15),m_hAtr(INVALID_HANDLE),
                                     m_hEmaFast(INVALID_HANDLE),m_hEmaSlow(INVALID_HANDLE),
-                                    m_hRsi(INVALID_HANDLE),m_ready(false) {}
+                                    m_hRsi(INVALID_HANDLE),m_hGuardMa(INVALID_HANDLE),
+                                    m_hGuardAtr(INVALID_HANDLE),m_ready(false) {}
                     ~CSignal(void) { Release(); }
 
    bool              IsReady(void) const { return(m_ready); }
@@ -101,9 +109,12 @@ public:
       m_hEmaFast=iMA (m_symbol,m_tf,m_cfg.emaFastPeriod,0,MODE_EMA,PRICE_CLOSE);
       m_hEmaSlow=iMA (m_symbol,m_tf,m_cfg.emaSlowPeriod,0,MODE_EMA,PRICE_CLOSE);
       m_hRsi    =iRSI(m_symbol,m_tf,m_cfg.rsiPeriod,PRICE_CLOSE);
+      m_hGuardMa =iMA (m_symbol,m_cfg.guardTf,m_cfg.guardPeriod,0,MODE_EMA,PRICE_CLOSE);
+      m_hGuardAtr=iATR(m_symbol,m_cfg.guardTf,m_cfg.atrPeriod);
 
       m_ready=(m_hAtr!=INVALID_HANDLE && m_hEmaFast!=INVALID_HANDLE &&
-               m_hEmaSlow!=INVALID_HANDLE && m_hRsi!=INVALID_HANDLE);
+               m_hEmaSlow!=INVALID_HANDLE && m_hRsi!=INVALID_HANDLE &&
+               m_hGuardMa!=INVALID_HANDLE && m_hGuardAtr!=INVALID_HANDLE);
       if(!m_ready)
         {
          PrintFormat("QQX: failed to create indicators for %s %s",m_symbol,QQXTfToString(m_tf));
@@ -124,6 +135,8 @@ public:
       if(m_hEmaFast!=INVALID_HANDLE) { IndicatorRelease(m_hEmaFast); m_hEmaFast=INVALID_HANDLE; }
       if(m_hEmaSlow!=INVALID_HANDLE) { IndicatorRelease(m_hEmaSlow); m_hEmaSlow=INVALID_HANDLE; }
       if(m_hRsi    !=INVALID_HANDLE) { IndicatorRelease(m_hRsi);     m_hRsi    =INVALID_HANDLE; }
+      if(m_hGuardMa !=INVALID_HANDLE) { IndicatorRelease(m_hGuardMa);  m_hGuardMa =INVALID_HANDLE; }
+      if(m_hGuardAtr!=INVALID_HANDLE) { IndicatorRelease(m_hGuardAtr); m_hGuardAtr=INVALID_HANDLE; }
       m_ready=false;
      }
 
@@ -137,6 +150,62 @@ public:
       double v=0.0;
       if(!Value(m_hAtr,0,1,v)) return(0.0);
       return(v);
+     }
+
+
+   //+---------------------------------------------------------------+
+   //| Higher-timeframe trend guard.                                  |
+   //|                                                                |
+   //| Returns true while it is still acceptable to ADD to a basket    |
+   //| running in direction "isBuy".  This never opens anything; its   |
+   //| only job is to stop the grid from averaging into a sustained    |
+   //| one-way move.                                                   |
+   //|                                                                |
+   //| Why: in the 2026 backtest 440 of 445 baskets were profitable    |
+   //| and the five that were not all share one signature - the grid   |
+   //| kept adding while a higher-timeframe trend ran against it.  The |
+   //| 2026-02-24 basket averaged in at 5174 and was closed at 4349,   |
+   //| 826 USD later, having exhausted all eight levels inside the     |
+   //| first 18 USD of the move.                                       |
+   //+---------------------------------------------------------------+
+   bool              AllowsGridAdd(const bool isBuy) const
+     {
+      if(!m_ready) return(true);           // fail open: never strand a basket
+      if(m_cfg.guardSlopeAtr<=0.0) return(true);
+
+      double ma0=0.0,ma1=0.0,atr=0.0;
+      if(!Value(m_hGuardMa,0,1,ma0))  return(true);
+      if(!Value(m_hGuardMa,0,3,ma1))  return(true);
+      if(!Value(m_hGuardAtr,0,1,atr)) return(true);
+      if(atr<=0.0) return(true);
+
+      //--- slope of the guard EMA over two of its bars, measured in ATR
+      double slope=(ma0-ma1)/2.0/atr;
+
+      if(isBuy  && slope<=-m_cfg.guardSlopeAtr) return(false);
+      if(!isBuy && slope>= m_cfg.guardSlopeAtr) return(false);
+      return(true);
+     }
+
+   //+---------------------------------------------------------------+
+   //| Volatility regime gate for NEW baskets.                        |
+   //|                                                                |
+   //| A grid opened into an expanding-volatility regime is the one    |
+   //| that runs out of levels.  Blocks a fresh basket when the        |
+   //| current ATR is far above its own recent average.                |
+   //+---------------------------------------------------------------+
+   bool              VolatilityOk(void) const
+     {
+      if(!m_ready) return(true);
+      if(m_cfg.maxAtrRatio<=0.0) return(true);
+
+      double buf[];
+      if(CopyBuffer(m_hAtr,0,1,50,buf)!=50) return(true);
+      double sum=0.0;
+      for(int i=0;i<50;i++) sum+=buf[i];
+      double avg=sum/50.0;
+      if(avg<=0.0) return(true);
+      return((buf[0]/avg)<=m_cfg.maxAtrRatio);
      }
 
    //+---------------------------------------------------------------+

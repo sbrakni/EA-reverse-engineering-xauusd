@@ -85,7 +85,10 @@ enum ENUM_QQX_CLOSE_REASON
    QQX_CLOSE_TRAIL     = 2,  // profit trail gave back too much
    QQX_CLOSE_SESSION   = 3,  // hard session/lifetime expiry
    QQX_CLOSE_STOP      = 4,  // basket protective stop
-   QQX_CLOSE_PANIC     = 5   // account level protection
+   QQX_CLOSE_PANIC     = 5,  // account level protection
+   QQX_CLOSE_BREAKEVEN = 6,  // aged basket released at break-even
+   QQX_CLOSE_GIVEUP    = 7,  // aged basket released at a bounded loss
+   QQX_CLOSE_PARTIAL   = 8   // pair de-risk (subset of the basket)
   };
 
 //+------------------------------------------------------------------+

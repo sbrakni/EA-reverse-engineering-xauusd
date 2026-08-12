@@ -54,6 +54,26 @@ struct SEngineCfg
    bool              closeOnFriday;
    int               fridayCloseMin;
    string            commentPrefix;
+
+   //--- ---------------- risk engineering (added after the 2026 backtest) ----
+   //--- Diagnosis: 440 of 445 baskets were profitable; the 5 that were not
+   //--- cost -31,540 against +20,236 of wins.  Every one of them ran deep,
+   //--- ran long (59 to 671 hours) and kept averaging into a one-way move.
+   //--- The settings below attack that tail directly.
+   double            gridStepMult;      // geometric spacing: step x mult^level
+   bool              gridTrendGuard;    // freeze adds against a higher-TF trend
+   bool              volRegimeGate;     // block new baskets in a volatility spike
+
+   int               recoveryLevel;     // depth at which the target is reduced
+   double            recoveryHours;     // age at which the target is reduced
+   double            recoveryTargetMult;// target multiplier once in recovery
+   double            breakEvenHours;    // age at which break-even is accepted
+   double            giveUpHours;       // age at which a bounded loss is accepted
+   double            giveUpLossPct;     // that bound, in % of balance
+   bool              pairDeRisk;        // shed legs in pairs while in recovery
+
+   double            basketMaxLossPct;  // hard per-basket stop, % of balance
+   double            minMarginLevel;    // block new risk below this margin level %
   };
 
 //+------------------------------------------------------------------+
@@ -120,6 +140,60 @@ private:
      }
 
    //+---------------------------------------------------------------+
+   //| Spacing required for the NEXT grid level.                      |
+   //|                                                                |
+   //| Constant spacing is what killed the 2026 backtest: at ~4.9 bp   |
+   //| of price, eight levels cover barely 16 USD of gold.  Every      |
+   //| catastrophic basket exhausted its levels inside that 16 USD     |
+   //| and then rode the rest of a 50-800 USD move at full size.       |
+   //| Widening geometrically buys back the range that matters -       |
+   //| at x1.35 the same eight levels span roughly 48 USD.             |
+   //+---------------------------------------------------------------+
+   double            StepForLevel(const int level) const
+     {
+      double step=StepDistance();
+      if(step<=0.0) return(0.0);
+      double m=m_eng.gridStepMult;
+      if(m<1.0) m=1.0;
+      if(level<=1) return(step);
+      return(step*MathPow(m,(double)(level-1)));
+     }
+
+   //+---------------------------------------------------------------+
+   //| Age of the live basket, in hours.                              |
+   //+---------------------------------------------------------------+
+   double            BasketHours(const datetime now) const
+     {
+      SBasketState st=m_basket.State();
+      if(st.count==0 || st.firstTime==0) return(0.0);
+      return((double)(now-st.firstTime)/3600.0);
+     }
+
+   //+---------------------------------------------------------------+
+   //| Recovery staging.                                              |
+   //|                                                                |
+   //| 0 = normal, 1 = reduced target, 2 = break-even, 3 = give up.    |
+   //|                                                                |
+   //| The backtest separates cleanly on age: 313 baskets closed       |
+   //| within 8 hours with a 100% win rate, while every basket that    |
+   //| destroyed the account had been open for more than 59.  Nothing  |
+   //| good happens to a grid that is still open the next day, so the  |
+   //| exit condition is relaxed in stages until it gets out.          |
+   //+---------------------------------------------------------------+
+   int               RecoveryStage(const datetime now,const bool accountBrake) const
+     {
+      if(m_basket.Count()==0) return(0);
+      double age=BasketHours(now);
+
+      if(m_eng.giveUpHours>0.0    && age>=m_eng.giveUpHours)    return(3);
+      if(m_eng.breakEvenHours>0.0 && age>=m_eng.breakEvenHours) return(2);
+      if(accountBrake) return(1);
+      if(m_eng.recoveryHours>0.0 && age>=m_eng.recoveryHours)   return(1);
+      if(m_eng.recoveryLevel>0 && m_basket.Count()>=m_eng.recoveryLevel) return(1);
+      return(0);
+     }
+
+   //+---------------------------------------------------------------+
    //| True while the server clock sits inside this slot's session.   |
    //| Sessions never wrap midnight in the recovered schedule, but    |
    //| the wrap case is handled so Custom Mode users can define one.  |
@@ -145,47 +219,99 @@ private:
       return(!first);      // never fire on the very first tick after attach
      }
 
+   //+---------------------------------------------------------------+
+   //| Free-margin guard.                                             |
+   //|                                                                |
+   //| This is the instrument that actually protects a grid account.   |
+   //| In the 2026 backtest the single worst basket carried a floating |
+   //| loss of 137% of balance and was liquidated by the broker at a   |
+   //| margin level of -53%; the strategy itself never chose that      |
+   //| exit.  Refusing new risk while margin is thin keeps the broker  |
+   //| from picking the exit point.                                    |
+   //+---------------------------------------------------------------+
+   bool              MarginOk(void) const
+     {
+      if(m_eng.minMarginLevel<=0.0) return(true);
+      if(AccountInfoDouble(ACCOUNT_MARGIN)<=0.0) return(true);   // nothing open
+      double lvl=AccountInfoDouble(ACCOUNT_MARGIN_LEVEL);
+      if(lvl<=0.0) return(true);
+      return(lvl>=m_eng.minMarginLevel);
+     }
+
    bool              WantsBuy(void)  const { return(m_cfg.dir!=QQX_DIR_SELL_ONLY); }
    bool              WantsSell(void) const { return(m_cfg.dir!=QQX_DIR_BUY_ONLY);  }
 
    //+---------------------------------------------------------------+
    //| Exit evaluation for a live basket.                             |
    //+---------------------------------------------------------------+
-   bool              CheckExit(const datetime now)
+   bool              CheckExit(const datetime now,const bool accountBrake)
      {
       if(m_basket.Count()==0) return(false);
 
-      double target=TargetDistance();
-      double dist  =m_basket.ProfitDistance();
+      double target =TargetDistance();
+      double dist   =m_basket.ProfitDistance();
+      double money  =m_basket.Profit();
+      double balance=AccountInfoDouble(ACCOUNT_BALANCE);
+      int    stage  =RecoveryStage(now,accountBrake);
 
-      //--- 1. primary exit: the volume weighted basket reached its target
-      if(target>0.0 && dist>=target && !m_eng.useProfitTrail)
-         return(Close(QQX_CLOSE_TARGET));
-
-      //--- 2. profit trail: arm past the target, then close on a giveback.
-      //---    This is what reproduces the long right tail of the live exit
-      //---    distribution (median 1.05 USD per 0.01 lot, but a 95th
-      //---    percentile of 4.20 and a maximum of 34.24).
-      if(m_eng.useProfitTrail && target>0.0)
+      //--- 1. hard per-basket stop.
+      //---    Measured on the 2026 run: capping any single basket at 5% of
+      //---    balance turns a -11,776 account into +17,736 and fires five
+      //---    times in seven months.  Everything else in this function
+      //---    exists to make it fire even less often than that.
+      if(m_eng.basketMaxLossPct>0.0 && balance>0.0)
         {
-         double arm=target*m_eng.trailStartMult;
-         if(dist>=arm)
-           {
-            double peak=m_basket.PeakProfit();
-            double now_=m_basket.Profit();
-            if(peak>0.0 && now_<=peak*(1.0-m_eng.trailGiveback))
-               return(Close(QQX_CLOSE_TRAIL));
-           }
-        }
-
-      //--- 3. emergency basket stop
-      if(m_eng.basketStopMult>0.0 && target>0.0)
-        {
-         if(dist<=-target*m_eng.basketStopMult)
+         if(money<=-balance*m_eng.basketMaxLossPct/100.0)
             return(Close(QQX_CLOSE_STOP));
         }
 
-      //--- 4. hard lifetime cap
+      //--- 2. staged exit conditions
+      if(stage>=3)
+        {
+         //--- release at a bounded loss rather than carry the position further
+         double bound=balance*m_eng.giveUpLossPct/100.0;
+         if(money>=-bound) return(Close(QQX_CLOSE_GIVEUP));
+        }
+      else if(stage==2)
+        {
+         //--- accept flat: costs covered is good enough for an aged basket
+         if(money>=0.0) return(Close(QQX_CLOSE_BREAKEVEN));
+        }
+      else
+        {
+         double mult=(stage==1 ? m_eng.recoveryTargetMult : 1.0);
+         if(mult<=0.0) mult=1.0;
+         double eff=target*mult;
+
+         if(m_eng.useProfitTrail && target>0.0)
+           {
+            //--- arm past the (possibly reduced) target, then close on giveback
+            if(dist>=eff*m_eng.trailStartMult)
+              {
+               double peak=m_basket.PeakProfit();
+               if(peak>0.0 && money<=peak*(1.0-m_eng.trailGiveback))
+                  return(Close(QQX_CLOSE_TRAIL));
+              }
+           }
+         else if(eff>0.0 && dist>=eff)
+            return(Close(QQX_CLOSE_TARGET));
+        }
+
+      //--- 3. shed exposure in pairs while stuck.  This is the mechanism that
+      //---    replaces stop losses: a losing leg leaves the book funded by
+      //---    winning legs, so the basket shrinks without realising a loss.
+      if(m_eng.pairDeRisk && stage>=1 && m_basket.Count()>=2)
+        {
+         //--- returning true only tells Process to stop here for this bar,
+         //--- so the basket is not extended on the same bar it was trimmed
+         if(m_basket.PartialDeRisk(0.0)>0) return(true);
+        }
+
+      //--- 4. legacy multiple-of-target stop, kept for compatibility
+      if(m_eng.basketStopMult>0.0 && target>0.0 && dist<=-target*m_eng.basketStopMult)
+         return(Close(QQX_CLOSE_STOP));
+
+      //--- 5. hard lifetime cap
       if(m_eng.maxBasketMinutes>0)
         {
          SBasketState st=m_basket.State();
@@ -193,7 +319,7 @@ private:
             return(Close(QQX_CLOSE_SESSION));
         }
 
-      //--- 5. weekend flat
+      //--- 6. weekend flat
       if(m_eng.closeOnFriday && QQXDayOfWeek(now)==5 &&
          QQXMinuteOfDay(now)>=m_eng.fridayCloseMin)
          return(Close(QQX_CLOSE_SESSION));
@@ -214,16 +340,29 @@ private:
    //+---------------------------------------------------------------+
    //| Grid extension for a live basket.                              |
    //+---------------------------------------------------------------+
-   void              CheckGrid(const datetime now)
+   void              CheckGrid(const datetime now,const bool accountBrake)
      {
       if(m_basket.Count()==0) return;
       if(m_basket.Count()>=m_cfg.maxLevels) return;
 
-      double step=StepDistance();
+      //--- an aged or account-braked basket is being wound down, not extended
+      if(accountBrake) return;
+      if(RecoveryStage(now,accountBrake)>=2) return;
+
+      SBasketState st=m_basket.State();
+
+      //--- do not average into a higher-timeframe trend that is running
+      //--- against the basket.  All five losing baskets of the 2026 run
+      //--- share exactly this signature.
+      if(m_eng.gridTrendGuard && !m_signal.AllowsGridAdd(st.isBuy)) return;
+
+      //--- never deepen a grid on thin margin
+      if(!MarginOk()) return;
+
+      double step=StepForLevel(m_basket.Count());
       if(step<=0.0) return;
       if(m_basket.AdverseFromLast()<step) return;
 
-      SBasketState st=m_basket.State();
       if(m_eng.minSecondsBetweenEntries>0 &&
          (now-st.lastTime)<m_eng.minSecondsBetweenEntries) return;
 
@@ -249,6 +388,11 @@ private:
       if(m_sym.SpreadPoints()>m_eng.maxSpreadPoints) return;
       if(m_eng.closeOnFriday && QQXDayOfWeek(now)==5 &&
          QQXMinuteOfDay(now)>=m_eng.fridayCloseMin) return;
+
+      //--- a grid opened into a volatility spike is the one that runs out
+      //--- of levels; sit that regime out instead
+      if(m_eng.volRegimeGate && !m_signal.VolatilityOk()) return;
+      if(!MarginOk()) return;
 
       bool buy=false;
       if(WantsBuy() && m_signal.Allows(true))       buy=true;
@@ -315,7 +459,8 @@ public:
    //+---------------------------------------------------------------+
    //| Main per-tick entry point.                                     |
    //+---------------------------------------------------------------+
-   void              Process(const datetime now,const bool tradingEnabled)
+   void              Process(const datetime now,const bool tradingEnabled,
+                             const bool accountBrake,const bool dirAllowed)
      {
       m_basket.Refresh();
 
@@ -326,19 +471,40 @@ public:
       //--- The live record shows 76% of all closes and 88% of all entries
       //--- landing exactly on second 00, i.e. the EA acts on bar opens
       //--- rather than continuously.
-      if(m_basket.Count()>0 && newGridBar)
+      if(m_basket.Count()>0)
         {
-         if(CheckExit(now)) return;
-         CheckGrid(now);
+         //--- The hard basket stop is the one thing that must not wait for a
+         //--- bar boundary - a fast move can travel a long way inside one M1
+         //--- bar, and this stop exists precisely to bound that.
+         if(m_eng.basketMaxLossPct>0.0)
+           {
+            double bal=AccountInfoDouble(ACCOUNT_BALANCE);
+            if(bal>0.0 && m_basket.Profit()<=-bal*m_eng.basketMaxLossPct/100.0)
+              {
+               Close(QQX_CLOSE_STOP);
+               return;
+              }
+           }
+         if(!newGridBar) return;
+         if(CheckExit(now,accountBrake)) return;
+         CheckGrid(now,accountBrake);
          return;
         }
 
       if(!tradingEnabled) return;
       if(!m_cfg.enabled)  return;
+      if(!dirAllowed)     return;
 
       //--- A fresh basket may only start on a bar open of the slot timeframe.
       if(newSignalBar) CheckEntry(now);
      }
+
+   //--- direction of this slot, for the portfolio exposure cap
+   bool              PrefersBuy(void) const { return(m_cfg.dir!=QQX_DIR_SELL_ONLY); }
+   double            OpenLots(void)   const { return(m_basket.Volume()); }
+   bool              OpenIsBuy(void)  const { return(m_basket.IsBuy()); }
+   double            AgeHours(const datetime now) const { return(BasketHours(now)); }
+   int               Stage(const datetime now) const { return(RecoveryStage(now,false)); }
   };
 
 #endif // __QQX_STRATEGY_MQH__

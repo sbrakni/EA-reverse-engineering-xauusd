@@ -8,8 +8,10 @@ A clean-room MetaTrader 5 Expert Advisor reconstructed by reverse engineering th
 The EA is built entirely from the trade record and the public product page. No
 vendor binary was decompiled and no vendor source was used.
 
-**[docs/REVERSE_ENGINEERING.md](docs/REVERSE_ENGINEERING.md) is the substance of
-this project** — every default in the code is traced back to a measurement there.
+**[docs/REVERSE_ENGINEERING.md](docs/REVERSE_ENGINEERING.md)** traces every
+default back to a measurement in the live signal.
+**[docs/OPTIMIZATION.md](docs/OPTIMIZATION.md)** is the post-backtest risk
+analysis — read it before running this on anything.
 
 ---
 
@@ -89,6 +91,15 @@ RAW/ECN spreads, leverage ≥ 1:100, VPS.
 | `All` | all 12 |
 | `Custom` | the 12 `InpS01…InpS12` switches (the product's "Custom Mode") |
 
+Preset **files** (`MQL5/Presets/`) also carry the risk settings, which the
+`InpPreset` enum does not:
+
+| File | Use |
+|---|---|
+| `QQX_Survivable.set` | **start here** — 0.0035 lots/1000, ×1.35 spacing, margin guard, no liquidation |
+| `QQX_Conservative.set` | half that size again, 6 levels, ×1.50 spacing, 800 % margin floor |
+| `QQX_Default.set` / `QQX_LowRisk.set` | the as-reconstructed settings; `QQX_LowRisk.set` is the one that blew up in the 2026 test |
+
 ## The strategy table
 
 | # | Session (server) | TF | Dir | Live baskets | TP (bp) | Step (bp) | Max levels |
@@ -130,7 +141,37 @@ fixed-point modes.
 | `InpDailyLossStop` | 0 | Stop opening after −N for the day |
 
 The account-protection inputs are **additions**, not reconstructions — the original
-shows no evidence of them. They default to off.
+shows no evidence of them.
+
+### Risk settings added after the 2026 backtest
+
+A test of `QQX_LowRisk.set` over 2026.01.01–2026.08.11 ended at **−11,776** on a
+10,000 account — yet **440 of its 445 baskets were profitable**. All the damage
+came from two settings:
+
+* `InpEquityStopPercent=60` liquidated four baskets that still had 202–336 %
+  margin level, for −19,802. Of the 42 baskets that dipped that deep, 37
+  recovered on their own.
+* 0.0100 lots per 1000 was too large for the drawdown this grid needs to
+  survive — one basket ran a floating loss of 137 % of balance and was
+  margin-called, for −11,738.
+
+| Input | Default | Meaning |
+|---|---|---|
+| `InpLotsPer1000` | **0.005** | 0.0100 margin-called; 0.0050 survives (73 % worst margin level), 0.0035 has headroom (181 %) |
+| `InpMinMarginLevel` | 400 | refuse new baskets and grid adds below this margin level — the guard that actually protects a grid |
+| `InpSoftBrakePercent` | 70 | below this equity/balance: stop opening and stop averaging, **without** realising anything |
+| `InpEquityStopPercent` | **0 (off)** | liquidation, not a stop loss — this is what cost −19,802 |
+| `InpBasketMaxLossPct` | **0 (off)** | a 5 % per-basket stop fires 45× and 40 of those baskets were winners |
+| `InpGridStepMult` | 1.35 | geometric spacing: 8 levels cover ~48 USD instead of ~16 |
+| `InpGridTrendGuard` | true | freeze the grid rather than average into a higher-timeframe trend |
+| `InpRecoveryHours` / `InpBreakEvenHours` | 4 / 24 | aged baskets relax their target, then accept flat — never a forced loss |
+| `InpPairDeRisk` | true | close a losing leg funded by winning legs: sheds exposure with no realised loss |
+
+Counterintuitive but measured: **adding stop losses makes this system worse.**
+Its edge is recovering from deep excursions. The fix is smaller size and a margin
+guard, not tighter stops. Full working in
+[docs/OPTIMIZATION.md](docs/OPTIMIZATION.md).
 
 ## Repository layout
 
@@ -144,6 +185,7 @@ MQL5/Include/QQX/Basket.mqh                    basket aggregate and bulk close
 MQL5/Include/QQX/Strategy.mqh                  one session slot: session/grid/exit
 MQL5/Presets/*.set                             ready-made preset files
 analysis/verify_model.py                       ties the EA's constants back to the data
+analysis/bt_extract.py, bt_analyse.py, bt_risk.py   backtest post-mortem
 analysis/                                      the Python used to derive everything
 docs/REVERSE_ENGINEERING.md                    evidence for every default
 ```

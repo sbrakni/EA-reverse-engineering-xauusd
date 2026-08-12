@@ -40,7 +40,7 @@ input string          InpComment            = "QQX";              // Order comme
 input group "=== Money management ==="
 input ENUM_QQX_MM     InpMMMode             = QQX_MM_BALANCE;     // Sizing mode
 input double          InpFixedLot           = 0.01;               // Fixed lot (QQX_MM_FIXED)
-input double          InpLotsPer1000        = 0.02;               // Lots per 1000 balance
+input double          InpLotsPer1000        = 0.005;              // Lots per 1000 balance
 input double          InpMaxLot             = 10.0;               // Hard lot cap
 input double          InpGridLotMultiplier  = 1.0;                // Grid volume multiplier
 
@@ -77,8 +77,30 @@ input double          InpRsiSellMin         = 48.0;               // Sell only a
 input int             InpExtremeLookback    = 24;                 // Swing lookback (bars)
 input double          InpPullbackAtr        = 0.50;               // Required retrace (x ATR)
 
+input group "=== Risk engineering (post-backtest) ==="
+input double          InpGridStepMult       = 1.35;               // Grid spacing growth per level
+input bool            InpGridTrendGuard     = true;               // Freeze grid against a HTF trend
+input ENUM_TIMEFRAMES InpGuardTimeframe     = PERIOD_H1;          // Trend-guard timeframe
+input int             InpGuardPeriod        = 50;                 // Trend-guard EMA period
+input double          InpGuardSlopeAtr      = 0.12;               // Opposing slope that blocks adds (ATR/bar)
+input bool            InpVolRegimeGate      = true;               // Skip new baskets in a volatility spike
+input double          InpMaxAtrRatio        = 2.20;               // ATR / average ATR ceiling
+
+input group "=== Basket recovery (fewer stop-outs) ==="
+input int             InpRecoveryLevel      = 5;                  // Reduce target from this depth
+input double          InpRecoveryHours      = 4.0;                // Reduce target from this age (h)
+input double          InpRecoveryTargetMult = 0.35;               // Target multiplier in recovery
+input double          InpBreakEvenHours     = 24.0;               // Accept break-even from this age (h)
+input double          InpGiveUpHours        = 0.0;                // Accept bounded loss from this age (h, 0=off)
+input double          InpGiveUpLossPct      = 1.0;                // That bound, % of balance
+input bool            InpPairDeRisk         = true;               // Shed legs in funded pairs
+
 input group "=== Account protection ==="
+input double          InpMinMarginLevel     = 400.0;              // Block new risk below this margin level %
+input double          InpBasketMaxLossPct   = 0.0;                // Hard per-basket stop, % of balance (0=off)
 input int             InpMaxTotalPositions  = 40;                 // Max positions across all slots
+input double          InpMaxLotsPerSide     = 0.0;                // Max total lots per direction (0=off, see docs)
+input double          InpSoftBrakePercent   = 70.0;               // Below N% of balance: no new risk (0=off)
 input double          InpEquityStopPercent  = 0.0;                // Flatten below N% of balance (0=off)
 input double          InpDailyLossStop      = 0.0;                // Stop for the day after -N money (0=off)
 
@@ -115,6 +137,7 @@ datetime       g_dayStamp    =0;
 double         g_dayStartEq   =0.0;
 bool           g_dayBlocked   =false;
 bool           g_panic        =false;
+bool           g_braked       =false;
 
 //+------------------------------------------------------------------+
 //| The recovered session schedule.                                  |
@@ -279,6 +302,20 @@ int OnInit(void)
    g_eng.fridayCloseMin          =InpFridayCloseHour*60;
    g_eng.commentPrefix           =InpComment;
 
+   //--- risk engineering, added after diagnosing the 2026 backtest
+   g_eng.gridStepMult            =(InpGridStepMult<1.0 ? 1.0 : InpGridStepMult);
+   g_eng.gridTrendGuard          =InpGridTrendGuard;
+   g_eng.volRegimeGate           =InpVolRegimeGate;
+   g_eng.recoveryLevel           =InpRecoveryLevel;
+   g_eng.recoveryHours           =InpRecoveryHours;
+   g_eng.recoveryTargetMult      =QQXClamp(InpRecoveryTargetMult,0.05,1.0);
+   g_eng.breakEvenHours          =InpBreakEvenHours;
+   g_eng.giveUpHours             =InpGiveUpHours;
+   g_eng.giveUpLossPct           =InpGiveUpLossPct;
+   g_eng.pairDeRisk              =InpPairDeRisk;
+   g_eng.basketMaxLossPct        =InpBasketMaxLossPct;
+   g_eng.minMarginLevel          =InpMinMarginLevel;
+
    //--- entry filter
    g_sig.atrPeriod        =InpAtrPeriod;
    g_sig.emaFastPeriod    =InpEmaFastPeriod;
@@ -291,6 +328,10 @@ int OnInit(void)
    g_sig.useTrendFilter   =InpUseTrendFilter;
    g_sig.useRsiFilter     =InpUseRsiFilter;
    g_sig.usePullbackFilter=InpUsePullbackFilter;
+   g_sig.guardTf          =InpGuardTimeframe;
+   g_sig.guardPeriod      =InpGuardPeriod;
+   g_sig.guardSlopeAtr    =InpGuardSlopeAtr;
+   g_sig.maxAtrRatio      =InpMaxAtrRatio;
 
    BuildStrategyTable();
    if(g_count==0)
@@ -301,6 +342,22 @@ int OnInit(void)
 
    g_dayStartEq=AccountInfoDouble(ACCOUNT_EQUITY);
    g_dayStamp  =DayStamp(TimeCurrent());
+
+   //--- Two settings destroyed the 2026 backtest.  Warn loudly about both.
+   if(InpEquityStopPercent>0.0)
+      PrintFormat("QQX WARNING: InpEquityStopPercent=%.0f is a LIQUIDATION, not a stop loss. "
+                  "In the 2026 test it flattened 4 baskets that still had 202-336%% margin "
+                  "level and cost -19,802.  37 of the 42 baskets that dipped that deep "
+                  "recovered on their own.  Prefer InpSoftBrakePercent + InpMinMarginLevel.",
+                  InpEquityStopPercent);
+   if(InpBasketMaxLossPct>0.0)
+      PrintFormat("QQX WARNING: InpBasketMaxLossPct=%.1f caps each basket, but a grid earns "
+                  "by recovering.  Measured on the 2026 test a 5%% cap would have fired 42 "
+                  "times and 37 of those baskets went on to win.",InpBasketMaxLossPct);
+   if(InpMMMode!=QQX_MM_FIXED && InpLotsPer1000>0.006)
+      PrintFormat("QQX WARNING: %.4f lots per 1000 exceeds the size the 2026 drawdowns "
+                  "survive.  At 0.0100 one basket margin-called at -53%% margin level; "
+                  "0.0050 survives with 73%%, 0.0035 with 181%%.",InpLotsPer1000);
 
    PrintFormat("QQX ready on %s - %d strategy slot(s), preset %s, magic base %I64u",
                sym,g_count,EnumToString(InpPreset),InpMagicBase);
@@ -325,12 +382,52 @@ datetime DayStamp(const datetime t)
   }
 
 //+------------------------------------------------------------------+
-//| Account level protection.  Returns false when new baskets are     |
-//| forbidden for the rest of the session/day.                        |
+//| Portfolio snapshot across every slot this EA owns.                |
 //+------------------------------------------------------------------+
-bool AccountGuard(const datetime now)
+struct SPortfolio
   {
-   //--- daily reset
+   int               positions;
+   double            lotsBuy;
+   double            lotsSell;
+  };
+
+SPortfolio ScanPortfolio(void)
+  {
+   SPortfolio p;
+   p.positions=0; p.lotsBuy=0.0; p.lotsSell=0.0;
+   for(int i=PositionsTotal()-1;i>=0;i--)
+     {
+      if(PositionGetTicket(i)==0) continue;
+      if(PositionGetString(POSITION_SYMBOL)!=g_sym.Symbol()) continue;
+      ulong m=(ulong)PositionGetInteger(POSITION_MAGIC);
+      if(m<InpMagicBase || m>=InpMagicBase+QQX_MAX_STRATEGIES*QQX_MAGIC_STRIDE) continue;
+      p.positions++;
+      double v=PositionGetDouble(POSITION_VOLUME);
+      if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY) p.lotsBuy+=v;
+      else                                                                          p.lotsSell+=v;
+     }
+   return(p);
+  }
+
+//+------------------------------------------------------------------+
+//| Account level protection.                                         |
+//|                                                                   |
+//| The original build carried a single hard equity stop, and the      |
+//| 2026 backtest showed why that is the wrong instrument: it fires    |
+//| at maximum adverse excursion and liquidates every slot at once,    |
+//| converting a floating drawdown into a realised -11,828.  It is     |
+//| replaced here by a two-stage brake:                                |
+//|                                                                    |
+//|   soft brake  -> stop opening, stop averaging, wind baskets down   |
+//|   hard stop   -> flatten, and only far below the soft level        |
+//|                                                                    |
+//| Sets "brake" when the soft level is breached.  Returns false when  |
+//| no NEW basket may be opened.                                       |
+//+------------------------------------------------------------------+
+bool AccountGuard(const datetime now,const SPortfolio &pf,bool &brake)
+  {
+   brake=false;
+
    datetime stamp=DayStamp(now);
    if(stamp!=g_dayStamp)
      {
@@ -341,23 +438,38 @@ bool AccountGuard(const datetime now)
 
    double equity =AccountInfoDouble(ACCOUNT_EQUITY);
    double balance=AccountInfoDouble(ACCOUNT_BALANCE);
+   double ratio  =(balance>0.0 ? equity/balance*100.0 : 100.0);
 
-   //--- hard equity floor: flatten everything, once
-   if(InpEquityStopPercent>0.0 && balance>0.0)
+   //--- soft brake: de-risk without realising anything
+   if(InpSoftBrakePercent>0.0 && ratio<InpSoftBrakePercent)
      {
-      if(equity<balance*InpEquityStopPercent/100.0)
+      brake=true;
+      if(!g_braked)
         {
-         if(!g_panic)
-           {
-            g_panic=true;
-            PrintFormat("QQX: equity %.2f fell below %.1f%% of balance %.2f - flattening",
-                        equity,InpEquityStopPercent,balance);
-            for(int i=0;i<g_count;i++) g_strat[i].PanicClose();
-           }
-         return(false);
+         g_braked=true;
+         PrintFormat("QQX: equity at %.1f%% of balance - soft brake on "
+                     "(no new baskets, no grid adds, baskets wind down)",ratio);
         }
-      g_panic=false;
      }
+   else if(g_braked && ratio>InpSoftBrakePercent+5.0)
+     {
+      g_braked=false;
+      Print("QQX: soft brake released");
+     }
+
+   //--- hard floor: last resort only
+   if(InpEquityStopPercent>0.0 && balance>0.0 && ratio<InpEquityStopPercent)
+     {
+      if(!g_panic)
+        {
+         g_panic=true;
+         PrintFormat("QQX: equity %.2f below %.1f%% of balance %.2f - flattening",
+                     equity,InpEquityStopPercent,balance);
+         for(int i=0;i<g_count;i++) g_strat[i].PanicClose();
+        }
+      return(false);
+     }
+   g_panic=false;
 
    //--- daily loss brake: stop opening, let live baskets finish
    if(InpDailyLossStop>0.0 && (g_dayStartEq-equity)>=InpDailyLossStop)
@@ -369,18 +481,9 @@ bool AccountGuard(const datetime now)
         }
      }
    if(g_dayBlocked) return(false);
+   if(brake)        return(false);
 
-   //--- global position cap
-   int mine=0;
-   for(int i=PositionsTotal()-1;i>=0;i--)
-     {
-      if(PositionGetTicket(i)==0) continue;
-      if(PositionGetString(POSITION_SYMBOL)!=g_sym.Symbol()) continue;
-      ulong m=(ulong)PositionGetInteger(POSITION_MAGIC);
-      if(m>=InpMagicBase && m<InpMagicBase+QQX_MAX_STRATEGIES*QQX_MAGIC_STRIDE) mine++;
-     }
-   if(InpMaxTotalPositions>0 && mine>=InpMaxTotalPositions) return(false);
-
+   if(InpMaxTotalPositions>0 && pf.positions>=InpMaxTotalPositions) return(false);
    return(true);
   }
 
@@ -391,21 +494,34 @@ void OnTick(void)
   {
    if(!g_sym.Refresh()) return;
 
-   datetime now=TimeCurrent();
-   bool canOpen=AccountGuard(now);
+   datetime   now=TimeCurrent();
+   SPortfolio pf =ScanPortfolio();
+   bool       brake=false;
+   bool       canOpen=AccountGuard(now,pf,brake);
+
+   //--- Portfolio exposure cap.  Nine of the eleven recovered slots are long
+   //--- gold, so a sell-off loads every one of them at the same time.  This
+   //--- caps how much the book may accumulate on a single side.
+   bool buyOk =true, sellOk=true;
+   if(InpMaxLotsPerSide>0.0)
+     {
+      buyOk =(pf.lotsBuy  < InpMaxLotsPerSide);
+      sellOk=(pf.lotsSell < InpMaxLotsPerSide);
+     }
 
    //--- Every slot always gets a chance to manage its own basket, even when
    //--- the account guard has forbidden new baskets.
    for(int i=0;i<g_count;i++)
-      g_strat[i].Process(now,canOpen);
+      g_strat[i].Process(now,canOpen,brake,
+                         g_strat[i].PrefersBuy() ? buyOk : sellOk);
 
-   if(InpShowPanel) DrawPanel(now,canOpen);
+   if(InpShowPanel) DrawPanel(now,canOpen,brake);
   }
 
 //+------------------------------------------------------------------+
 //| On-chart dashboard                                               |
 //+------------------------------------------------------------------+
-void DrawPanel(const datetime now,const bool canOpen)
+void DrawPanel(const datetime now,const bool canOpen,const bool brake)
   {
    static datetime lastDraw=0;
    if(now==lastDraw) return;         // once per second is plenty
@@ -425,23 +541,38 @@ void DrawPanel(const datetime now,const bool canOpen)
    s+="Quantum Queen X  (reconstruction)\n";
    s+=StringFormat("%s   spread %.0f pts   server %s\n",
                    g_sym.Symbol(),g_sym.SpreadPoints(),TimeToString(now,TIME_MINUTES|TIME_SECONDS));
-   s+=StringFormat("preset %s   slots %d   new baskets: %s\n",
-                   EnumToString(InpPreset),g_count,(canOpen?"allowed":"BLOCKED"));
+   double eq=AccountInfoDouble(ACCOUNT_EQUITY), bl=AccountInfoDouble(ACCOUNT_BALANCE);
+   s+=StringFormat("preset %s   slots %d   new baskets: %s%s\n",
+                   EnumToString(InpPreset),g_count,(canOpen?"allowed":"BLOCKED"),
+                   (brake?"   [SOFT BRAKE]":""));
+   s+=StringFormat("equity %.2f / balance %.2f = %.1f%%\n",
+                   eq,bl,(bl>0.0?eq/bl*100.0:100.0));
    s+=StringFormat("open %d pos / %.2f lots   floating %.2f   session P/L %.2f\n",
                    totalPos,totalVol,floating,realized);
    s+="------------------------------------------------------------\n";
-   s+="slot                    session      tf   dir   pos    lots   float\n";
+   s+="slot                    session      tf   dir   pos    lots   float   age   stage\n";
 
    for(int i=0;i<g_count;i++)
      {
-      s+=StringFormat("%-22s %-11s %-5s %-5s %3d  %6.2f  %7.2f\n",
+      int st=g_strat[i].Stage(now);
+      string stage="-";
+      if(g_strat[i].Positions()>0)
+        {
+         if(st==1)      stage="reduce";
+         else if(st==2) stage="b/even";
+         else if(st==3) stage="giveup";
+         else           stage="normal";
+        }
+      s+=StringFormat("%-22s %-11s %-5s %-5s %3d  %6.2f  %7.2f  %5.1f  %s\n",
                       g_strat[i].Name(),
                       g_strat[i].SessionText(),
                       QQXTfToString(g_strat[i].Timeframe()),
                       g_strat[i].DirText(),
                       g_strat[i].Positions(),
                       g_strat[i].Volume(),
-                      g_strat[i].Floating());
+                      g_strat[i].Floating(),
+                      g_strat[i].AgeHours(now),
+                      stage);
      }
    Comment(s);
   }

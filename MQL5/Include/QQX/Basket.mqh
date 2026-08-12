@@ -237,6 +237,88 @@ public:
       return(m_st.count==0 && allOk);
      }
 
+   //+---------------------------------------------------------------+
+   //| Partial de-risk ("pair close").                                |
+   //|                                                                |
+   //| Takes the deepest-losing leg and pairs it with as many of the   |
+   //| best legs as are needed for the subset to net >= minNet, then   |
+   //| closes that subset.  A stuck basket therefore sheds exposure    |
+   //| a leg at a time WITHOUT realising a loss, instead of sitting    |
+   //| at full size waiting for one all-or-nothing exit.               |
+   //|                                                                |
+   //| This is the mechanism that keeps the hard basket stop from      |
+   //| firing: in the 2026 backtest every catastrophic basket held     |
+   //| its full leg count for 59 to 671 hours.                         |
+   //|                                                                |
+   //| Returns the number of positions closed.                        |
+   //+---------------------------------------------------------------+
+   int               PartialDeRisk(const double minNet)
+     {
+      if(m_sym==NULL || m_trade==NULL) return(0);
+      if(m_st.count<2) return(0);
+
+      string sym=m_sym.Symbol();
+      ulong  tickets[];
+      double pnl[];
+      int    n=0;
+
+      for(int i=PositionsTotal()-1;i>=0;i--)
+        {
+         ulong ticket=PositionGetTicket(i);
+         if(ticket==0) continue;
+         if(PositionGetString(POSITION_SYMBOL)!=sym) continue;
+         if((ulong)PositionGetInteger(POSITION_MAGIC)!=m_magic) continue;
+         ArrayResize(tickets,n+1);
+         ArrayResize(pnl,n+1);
+         tickets[n]=ticket;
+         pnl[n]=PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP);
+         n++;
+        }
+      if(n<2) return(0);
+
+      //--- ascending by profit: worst first, best last
+      for(int a=0;a<n-1;a++)
+         for(int b=a+1;b<n;b++)
+            if(pnl[b]<pnl[a])
+              {
+               double tp=pnl[a]; pnl[a]=pnl[b]; pnl[b]=tp;
+               ulong  tt=tickets[a]; tickets[a]=tickets[b]; tickets[b]=tt;
+              }
+
+      if(pnl[0]>=0.0) return(0);            // nothing under water, nothing to pair
+
+      //--- greedily add the richest winners until the pair nets out
+      double sum=pnl[0];
+      int    take=1;
+      for(int i=n-1;i>0 && sum<minNet;i--)
+        {
+         if(pnl[i]<=0.0) break;             // no winners left to fund the pair
+         sum+=pnl[i];
+         take++;
+        }
+      if(sum<minNet || take<2) return(0);
+
+      //--- close the loser plus the winners that funded it
+      int closed=0;
+      m_trade.SetExpertMagicNumber(m_magic);
+      if(m_trade.PositionClose(tickets[0])) closed++;
+      double acc=pnl[0];
+      for(int i=n-1;i>0 && acc<minNet;i--)
+        {
+         if(pnl[i]<=0.0) break;
+         acc+=pnl[i];
+         if(m_trade.PositionClose(tickets[i])) closed++;
+        }
+
+      if(closed>0)
+        {
+         Refresh();
+         PrintFormat("QQX[%I64u]: pair-closed %d legs for %.2f, %d remain",
+                     m_magic,closed,sum,m_st.count);
+        }
+      return(closed);
+     }
+
    static string     ReasonToString(const ENUM_QQX_CLOSE_REASON r)
      {
       switch(r)
@@ -246,6 +328,9 @@ public:
          case QQX_CLOSE_SESSION: return("session expiry");
          case QQX_CLOSE_STOP   : return("basket stop");
          case QQX_CLOSE_PANIC  : return("account protection");
+         case QQX_CLOSE_BREAKEVEN: return("break-even release");
+         case QQX_CLOSE_GIVEUP : return("bounded give-up");
+         case QQX_CLOSE_PARTIAL: return("pair de-risk");
         }
       return("none");
      }

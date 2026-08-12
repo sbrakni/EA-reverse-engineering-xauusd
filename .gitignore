@@ -5,3 +5,4 @@ analysis/baskets*.csv
 analysis/trades*.csv
 analysis/steps.csv
 *.ex5
+analysis/bt_risk.csv
