@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+analysis/*.out
+analysis/baskets*.csv
+analysis/trades*.csv
+analysis/steps.csv
+*.ex5
